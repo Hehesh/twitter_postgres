@@ -1,292 +1,519 @@
 #!/usr/bin/python3
 
-# imports
-import sqlalchemy
-import os
+import argparse
 import datetime
-import zipfile
 import io
 import json
+import zipfile
+
+import sqlalchemy
+
 
 ################################################################################
-# helper functions
+# Helper functions
 ################################################################################
 
-
-def remove_nulls(s):
-    r'''
-    Postgres doesn't support strings with the null character \x00 in them, but twitter does.
-    This helper function replaces the null characters with an escaped version so that they can be loaded into postgres.
-    Technically, this means the data in postgres won't be an exact match of the data in twitter,
-    and there is no way to get the original twitter data back from the data in postgres.
-
-    The null character is extremely rarely used in real world text (approx. 1 in 1 billion tweets),
-    and so this isn't too big of a deal.
-    A more correct implementation, however, would be to *escape* the null characters rather than remove them.
-    This isn't hard to do in python, but it is a bit of a pain to do with the JSON/COPY commands for the denormalized data.
-    Since our goal is for the normalized/denormalized versions of the data to match exactly,
-    we're not going to escape the strings for the normalized data.
-
-    >>> remove_nulls('\x00')
-    ''
-    >>> remove_nulls('hello\x00 world')
-    'hello world'
-    '''
-    if s is None:
+def remove_nulls(value):
+    """
+    PostgreSQL does not allow the null character in strings.
+    """
+    if value is None:
         return None
-    else:
-        return s.replace('\x00','')
+
+    return value.replace("\x00", "")
+
+
+def get_table_columns(connection, table_name):
+    """
+    Return the columns that exist in a table.
+    """
+    sql = sqlalchemy.sql.text("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = :table_name
+    """)
+
+    rows = connection.execute(sql, {
+        "table_name": table_name
+    }).fetchall()
+
+    return {row[0] for row in rows}
 
 
 def get_id_urls(url, connection):
-    '''
-    Given a url, return the corresponding id in the urls table.
-    If no row exists for the url, then one is inserted automatically.
+    """
+    Return the ID for a URL, inserting the URL if necessary.
+    """
+    url = remove_nulls(url)
 
-    NOTE:
-    This function cannot be tested with standard python testing tools because it interacts with the db.
-    '''
-    sql = sqlalchemy.sql.text('''
-    insert into urls 
-        (url)
-        values
-        (:url)
-    on conflict do nothing
-    returning id_urls
-    ;
-    ''')
-    res = connection.execute(sql,{'url':url}).first()
+    sql = sqlalchemy.sql.text("""
+        INSERT INTO urls (url)
+        VALUES (:url)
+        ON CONFLICT DO NOTHING
+        RETURNING id_urls
+    """)
 
-    # when no conflict occurs, then the query above inserts a new row in the url table and returns id_urls in res[0];
-    # when a conflict occurs, then the query above does not insert or return anything;
-    # we need to run a select statement to put the already existing id_urls into res[0]
-    if res is None:
-        sql = sqlalchemy.sql.text('''
-        select id_urls 
-        from urls
-        where
-            url=:url
-        ''')
-        res = connection.execute(sql,{'url':url}).first()
+    result = connection.execute(sql, {
+        "url": url
+    }).first()
 
-    id_urls = res[0]
-    return id_urls
+    if result is None:
+        sql = sqlalchemy.sql.text("""
+            SELECT id_urls
+            FROM urls
+            WHERE url = :url
+        """)
+
+        result = connection.execute(sql, {
+            "url": url
+        }).first()
+
+    return result[0]
 
 
-def insert_tweet(connection,tweet):
-    '''
-    Insert the tweet into the database.
+def insert_user(connection, user, id_urls=None):
+    """
+    Insert or update a user.
 
-    Args:
-        connection: a sqlalchemy connection to the postgresql db
-        tweet: a dictionary representing the json tweet object
+    The normalized assignment schema only requires id_users and id_urls.
+    """
+    user_columns = get_table_columns(connection, "users")
 
-    NOTE:
-    This function cannot be tested with standard python testing tools because it interacts with the db.
-    
-    FIXME:
-    This function is only partially implemented.
-    You'll need to add appropriate SQL insert statements to get it to work.
-    '''
+    values = {
+        "id_users": user["id"],
+        "id_urls": id_urls,
+    }
 
-    # skip tweet if it's already inserted
-    sql=sqlalchemy.sql.text('''
-    SELECT id_tweets 
-    FROM tweets
-    WHERE id_tweets = :id_tweets
-    ''')
-    res = connection.execute(sql,{
-        'id_tweets':tweet['id'],
-        })
-    if res.first() is not None:
+    # These fields are included only if the database schema has them.
+    optional_values = {
+        "name": user.get("name"),
+        "screen_name": user.get("screen_name"),
+        "location": user.get("location"),
+        "description": user.get("description"),
+        "protected": user.get("protected"),
+        "followers_count": user.get("followers_count"),
+        "friends_count": user.get("friends_count"),
+        "listed_count": user.get("listed_count"),
+        "favourites_count": user.get("favourites_count"),
+        "statuses_count": user.get("statuses_count"),
+        "created_at": user.get("created_at"),
+        "utc_offset": user.get("utc_offset"),
+        "time_zone": user.get("time_zone"),
+        "geo_enabled": user.get("geo_enabled"),
+        "verified": user.get("verified"),
+    }
+
+    for key, value in optional_values.items():
+        if key in user_columns:
+            values[key] = remove_nulls(value) if isinstance(value, str) else value
+
+    columns = [
+        column for column in values
+        if column in user_columns
+    ]
+
+    insert_columns = ", ".join(columns)
+    insert_parameters = ", ".join(":" + column for column in columns)
+
+    updates = [
+        f"{column} = EXCLUDED.{column}"
+        for column in columns
+        if column != "id_users"
+    ]
+
+    if updates:
+        conflict_clause = "DO UPDATE SET " + ", ".join(updates)
+    else:
+        conflict_clause = "DO NOTHING"
+
+    sql = sqlalchemy.sql.text(f"""
+        INSERT INTO users ({insert_columns})
+        VALUES ({insert_parameters})
+        ON CONFLICT (id_users) {conflict_clause}
+    """)
+
+    connection.execute(sql, {
+        column: values[column]
+        for column in columns
+    })
+
+
+def insert_simple_row(connection, table_name, values, conflict_columns):
+    """
+    Insert a row while ignoring duplicate composite-key rows.
+    """
+    table_columns = get_table_columns(connection, table_name)
+
+    values = {
+        key: value
+        for key, value in values.items()
+        if key in table_columns
+    }
+
+    columns = list(values.keys())
+
+    if not columns:
         return
 
-    # insert tweet within a transaction;
-    # this ensures that a tweet does not get "partially" loaded
-    with connection.begin() as trans:
+    insert_columns = ", ".join(columns)
+    insert_parameters = ", ".join(":" + column for column in columns)
 
-        ########################################
-        # insert into the users table
-        ########################################
-        if tweet['user']['url'] is None:
+    sql = sqlalchemy.sql.text(f"""
+        INSERT INTO {table_name} ({insert_columns})
+        VALUES ({insert_parameters})
+        ON CONFLICT ({", ".join(conflict_columns)}) DO NOTHING
+    """)
+
+    connection.execute(sql, values)
+
+
+################################################################################
+# Tweet insertion
+################################################################################
+
+def insert_tweet(connection, tweet):
+    """
+    Insert one tweet and all related normalized records.
+    """
+    with connection.begin():
+        tweet_columns = get_table_columns(connection, "tweets")
+
+        # Skip tweets that have already been inserted.
+        sql = sqlalchemy.sql.text("""
+            SELECT id_tweets
+            FROM tweets
+            WHERE id_tweets = :id_tweets
+        """)
+
+        result = connection.execute(sql, {
+            "id_tweets": tweet["id"]
+        }).first()
+
+        if result is not None:
+            return
+
+        ########################################################################
+        # Insert the user who created the tweet.
+        ########################################################################
+
+        user = tweet["user"]
+
+        if user.get("url") is None:
             user_id_urls = None
         else:
-            user_id_urls = get_id_urls(tweet['user']['url'], connection)
+            user_id_urls = get_id_urls(user["url"], connection)
 
-        # create/update the user
-        sql = sqlalchemy.sql.text('''
-            ''')
+        insert_user(connection, user, user_id_urls)
 
-        ########################################
-        # insert into the tweets table
-        ########################################
+        ########################################################################
+        # Determine tweet text.
+        ########################################################################
 
         try:
-            geo_coords = tweet['geo']['coordinates']
-            geo_coords = str(tweet['geo']['coordinates'][0]) + ' ' + str(tweet['geo']['coordinates'][1])
-            geo_str = 'POINT'
-        except TypeError:
-            try:
-                geo_coords = '('
-                for i,poly in enumerate(tweet['place']['bounding_box']['coordinates']):
-                    if i>0:
-                        geo_coords+=','
-                    geo_coords+='('
-                    for j,point in enumerate(poly):
-                        geo_coords+= str(point[0]) + ' ' + str(point[1]) + ','
-                    geo_coords+= str(poly[0][0]) + ' ' + str(poly[0][1])
-                    geo_coords+=')'
-                geo_coords+=')'
-                geo_str = 'MULTIPOLYGON'
-            except KeyError:
-                if tweet['user']['geo_enabled']:
-                    geo_str = None
-                    geo_coords = None
-
-        try:
-            text = tweet['extended_tweet']['full_text']
-        except:
-            text = tweet['text']
-
-        try:
-            country_code = tweet['place']['country_code'].lower()
-        except TypeError:
-            country_code = None
-
-        if country_code == 'us':
-            state_code = tweet['place']['full_name'].split(',')[-1].strip().lower()
-            if len(state_code)>2:
-                state_code = None
-        else:
-            state_code = None
-
-        try:
-            place_name = tweet['place']['full_name']
-        except TypeError:
-            place_name = None
-
-        # NOTE:
-        # The tweets table has the following foreign key:
-        # > FOREIGN KEY (in_reply_to_user_id) REFERENCES users(id_users)
-        #
-        # This means that every "in_reply_to_user_id" field must reference a valid entry in the users table.
-        # If the id is not in the users table, then you'll need to add it in an "unhydrated" form.
-        if tweet.get('in_reply_to_user_id',None) is not None:
-            sql=sqlalchemy.sql.text('''
-                ''')
-
-        # insert the tweet
-        sql=sqlalchemy.sql.text(f'''
-            ''')
-
-        ########################################
-        # insert into the tweet_urls table
-        ########################################
-
-        try:
-            urls = tweet['extended_tweet']['entities']['urls']
+            text = tweet["extended_tweet"]["full_text"]
         except KeyError:
-            urls = tweet['entities']['urls']
+            text = tweet.get("text")
+
+        text = remove_nulls(text)
+
+        ########################################################################
+        # Determine location information.
+        ########################################################################
+
+        geometry_wkt = None
+        place_name = None
+        country_code = None
+        state_code = None
+
+        # Extract place metadata independently of geometry.
+        if tweet.get("place") is not None:
+            place = tweet["place"]
+            place_name = place.get("full_name")
+
+            country_code_value = place.get("country_code")
+            if country_code_value is not None:
+                country_code = country_code_value.lower()
+
+            if country_code == "us" and place_name is not None:
+                state_code = place_name.split(",")[-1].strip().lower()
+
+                if len(state_code) > 2:
+                    state_code = None
+
+        # Preserve original geometry priority: geo first, place second.
+        if tweet.get("geo") is not None:
+            coordinates = tweet["geo"]["coordinates"]
+            geometry_wkt = (
+                "POINT("
+                + str(coordinates[0])
+                + " "
+                + str(coordinates[1])
+                + ")"
+            )
+
+        elif tweet.get("place") is not None:
+            polygons = tweet["place"]["bounding_box"]["coordinates"]
+            polygon_text = []
+
+            for polygon in polygons:
+                points = [
+                    f"{point[0]} {point[1]}"
+                    for point in polygon
+                ]
+
+                points.append(
+                    f"{polygon[0][0]} {polygon[0][1]}"
+                )
+
+                polygon_text.append("(" + ",".join(points) + ")")
+
+            geometry_wkt = "MULTIPOLYGON(" + ",".join(
+                "(" + polygon + ")"
+                for polygon in polygon_text
+            ) + ")"
+            
+        ########################################################################
+        # Ensure reply-to users exist before inserting the tweet.
+        ########################################################################
+
+        in_reply_to_user_id = tweet.get("in_reply_to_user_id")
+
+        if in_reply_to_user_id is not None:
+            reply_user = {
+                "id": in_reply_to_user_id
+            }
+
+            insert_user(connection, reply_user)
+
+        ########################################################################
+        # Insert the tweet.
+        ########################################################################
+
+        tweet_values = {
+            "id_tweets": tweet["id"],
+            "id_users": tweet["user"]["id"],
+            "created_at": tweet.get("created_at"),
+            "text": text,
+            "source": remove_nulls(tweet.get("source")),
+            "truncated": tweet.get("truncated"),
+            "in_reply_to_status_id": tweet.get("in_reply_to_status_id"),
+            "in_reply_to_user_id": in_reply_to_user_id,
+            "quoted_status_id": tweet.get("quoted_status_id"),
+            "quoted_status": tweet.get("is_quote_status"),
+            "retweeted": tweet.get("retweeted"),
+            "favorite_count": tweet.get("favorite_count"),
+            "retweet_count": tweet.get("retweet_count"),
+            "lang": tweet.get("lang"),
+            "place_name": remove_nulls(place_name),
+            "country_code": country_code,
+            "state_code": state_code,
+        }
+
+        tweet_values = {
+            key: value
+            for key, value in tweet_values.items()
+            if key in tweet_columns
+        }
+
+        tweet_parameters = {
+            key: ":" + key
+            for key in tweet_values
+        }
+
+        # Handle a possible PostGIS coordinates column separately.
+        if "coordinates" in tweet_columns and geometry_wkt is not None:
+            tweet_parameters["coordinates"] = (
+                "ST_GeomFromText(:coordinates, 4326)"
+            )
+            tweet_values["coordinates"] = geometry_wkt
+
+        columns = ", ".join(tweet_values.keys())
+        parameters = ", ".join(tweet_parameters.values())
+
+        sql = sqlalchemy.sql.text(f"""
+            INSERT INTO tweets ({columns})
+            VALUES ({parameters})
+        """)
+
+        connection.execute(sql, tweet_values)
+
+        ########################################################################
+        # Extract URL entities.
+        ########################################################################
+
+        try:
+            urls = tweet["extended_tweet"]["entities"]["urls"]
+        except KeyError:
+            urls = tweet.get("entities", {}).get("urls", [])
 
         for url in urls:
-            id_urls = get_id_urls(url['expanded_url'], connection)
+            expanded_url = url.get("expanded_url")
 
-            sql=sqlalchemy.sql.text('''
-                ''')
+            if expanded_url is None:
+                continue
 
-        ########################################
-        # insert into the tweet_mentions table
-        ########################################
+            id_urls = get_id_urls(expanded_url, connection)
+
+            insert_simple_row(
+                connection,
+                "tweet_urls",
+                {
+                    "id_tweets": tweet["id"],
+                    "id_urls": id_urls,
+                },
+                ["id_tweets", "id_urls"],
+            )
+
+        ########################################################################
+        # Extract user mentions.
+        ########################################################################
 
         try:
-            mentions = tweet['extended_tweet']['entities']['user_mentions']
+            mentions = tweet["extended_tweet"]["entities"]["user_mentions"]
         except KeyError:
-            mentions = tweet['entities']['user_mentions']
+            mentions = tweet.get("entities", {}).get("user_mentions", [])
 
         for mention in mentions:
-            # insert into users table;
-            # note that we already have done an insert into the users table above for the user who sent a tweet;
-            # that insert had lots of information inside of it (i.e. the user row was "hydrated");
-            # when we only have a mention of a user, however, we do not have all the information to store in the row;
-            # therefore, we must store the user info "unhydrated"
-            # HINT:
-            # use the ON CONFLICT DO NOTHING syntax
-            sql=sqlalchemy.sql.text('''
-                ''')
+            mentioned_user = {
+                "id": mention["id"]
+            }
 
-            # insert into tweet_mentions
-            sql=sqlalchemy.sql.text('''
-                ''')
+            insert_user(connection, mentioned_user)
 
-        ########################################
-        # insert into the tweet_tags table
-        ########################################
+            insert_simple_row(
+                connection,
+                "tweet_mentions",
+                {
+                    "id_tweets": tweet["id"],
+                    "id_users": mention["id"],
+                },
+                ["id_tweets", "id_users"],
+            )
+
+        ########################################################################
+        # Extract hashtags and cashtags.
+        ########################################################################
 
         try:
-            hashtags = tweet['extended_tweet']['entities']['hashtags'] 
-            cashtags = tweet['extended_tweet']['entities']['symbols'] 
+            hashtags = tweet["extended_tweet"]["entities"]["hashtags"]
+            cashtags = tweet["extended_tweet"]["entities"]["symbols"]
         except KeyError:
-            hashtags = tweet['entities']['hashtags']
-            cashtags = tweet['entities']['symbols']
+            entities = tweet.get("entities", {})
+            hashtags = entities.get("hashtags", [])
+            cashtags = entities.get("symbols", [])
 
-        tags = [ '#'+hashtag['text'] for hashtag in hashtags ] + [ '$'+cashtag['text'] for cashtag in cashtags ]
+        tags = (
+            ["#" + hashtag["text"] for hashtag in hashtags] +
+            ["$" + cashtag["text"] for cashtag in cashtags]
+        )
 
         for tag in tags:
-            sql=sqlalchemy.sql.text('''
-                ''')
+            insert_simple_row(
+                connection,
+                "tweet_tags",
+                {
+                    "id_tweets": tweet["id"],
+                    "tag": remove_nulls(tag),
+                },
+                ["id_tweets", "tag"],
+            )
 
-        ########################################
-        # insert into the tweet_media table
-        ########################################
+        ########################################################################
+        # Extract media.
+        ########################################################################
 
         try:
-            media = tweet['extended_tweet']['extended_entities']['media']
+            media = tweet["extended_tweet"]["extended_entities"]["media"]
         except KeyError:
             try:
-                media = tweet['extended_entities']['media']
+                media = tweet["extended_entities"]["media"]
             except KeyError:
                 media = []
 
         for medium in media:
-            id_urls = get_id_urls(medium['media_url'], connection)
-            sql=sqlalchemy.sql.text('''
-                ''')
+            media_url = medium.get("media_url")
+
+            if media_url is None:
+                continue
+
+            id_urls = get_id_urls(media_url, connection)
+
+            insert_simple_row(
+                connection,
+                "tweet_media",
+                {
+                    "id_tweets": tweet["id"],
+                    "id_urls": id_urls,
+                    "type": medium.get("type"),
+                },
+                ["id_tweets", "id_urls"],
+            )
+
 
 ################################################################################
-# main functions
+# Main program
 ################################################################################
 
-if __name__ == '__main__':
-    
-    # process command line args
-    import argparse
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--db',required=True)
-    parser.add_argument('--inputs',nargs='+',required=True)
-    parser.add_argument('--print_every',type=int,default=1000)
+
+    parser.add_argument(
+        "--db",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--inputs",
+        nargs="+",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--print_every",
+        type=int,
+        default=1000,
+    )
+
     args = parser.parse_args()
 
-    # create database connection
-    engine = sqlalchemy.create_engine(args.db, connect_args={
-        'application_name': 'load_tweets.py',
-        })
+    engine = sqlalchemy.create_engine(
+        args.db,
+        connect_args={
+            "application_name": "load_tweets.py",
+        },
+    )
+
     connection = engine.connect()
 
-    # loop through the input file
-    # NOTE:
-    # we reverse sort the filenames because this results in fewer updates to the users table,
-    # which prevents excessive dead tuples and autovacuums
-    for filename in sorted(args.inputs, reverse=True):
-        with zipfile.ZipFile(filename, 'r') as archive: 
-            print(datetime.datetime.now(),filename)
-            for subfilename in sorted(archive.namelist(), reverse=True):
-                with io.TextIOWrapper(archive.open(subfilename)) as f:
-                    for i,line in enumerate(f):
+    try:
+        for filename in sorted(args.inputs, reverse=True):
+            print(datetime.datetime.now(), filename)
 
-                        # load and insert the tweet
-                        tweet = json.loads(line)
-                        insert_tweet(connection,tweet)
+            with zipfile.ZipFile(filename, "r") as archive:
+                for subfilename in sorted(
+                    archive.namelist(),
+                    reverse=True,
+                ):
+                    with io.TextIOWrapper(
+                        archive.open(subfilename)
+                    ) as input_file:
 
-                        # print message
-                        if i%args.print_every==0:
-                            print(datetime.datetime.now(),filename,subfilename,'i=',i,'id=',tweet['id'])
+                        for i, line in enumerate(input_file):
+                            tweet = json.loads(line)
+
+                            insert_tweet(connection, tweet)
+
+                            if i % args.print_every == 0:
+                                print(
+                                    datetime.datetime.now(),
+                                    filename,
+                                    subfilename,
+                                    "i=",
+                                    i,
+                                    "id=",
+                                    tweet["id"],
+                                )
+    finally:
+        connection.close()
+        engine.dispose()
